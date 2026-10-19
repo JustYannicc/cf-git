@@ -108,3 +108,5 @@ MIT (same as original isomorphic-git)
 ## Credits
 
 Based on [isomorphic-git](https://github.com/isomorphic-git/isomorphic-git) by William Hilton and contributors.
+
+Contributions by [Yannic Charlon](https://github.com/JustYannicc).

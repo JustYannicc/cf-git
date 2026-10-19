@@ -866,6 +866,15 @@
         "doc",
         "test"
       ]
+    },
+    {
+      "login": "JustYannicc",
+      "name": "Yannic Charlon",
+      "avatar_url": "https://avatars.githubusercontent.com/u/52761674?v=4",
+      "profile": "https://github.com/JustYannicc",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
