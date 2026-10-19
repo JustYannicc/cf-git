@@ -158,63 +158,60 @@ export async function _checkout({
 
     let count = 0
     const total = ops.length
-    await GitIndexManager.acquire({ fs, gitdir, cache }, async function(index) {
-      await Promise.all(
-        ops
-          .filter(
-            ([method]) => method === 'delete' || method === 'delete-index'
-          )
-          .map(async function([method, fullpath]) {
-            const filepath = `${dir}/${fullpath}`
-            if (method === 'delete') {
-              await fs.rm(filepath)
-            }
-            index.delete({ filepath: fullpath })
-            if (onProgress) {
-              await onProgress({
-                phase: 'Updating workdir',
-                loaded: ++count,
-                total,
-              })
-            }
-          })
-      )
-    })
-
-    // Note: this is cannot be done naively in parallel
-    await GitIndexManager.acquire({ fs, gitdir, cache }, async function(index) {
-      for (const [method, fullpath] of ops) {
-        if (method === 'rmdir' || method === 'rmdir-index') {
+    const indexDeletions = []
+    await batchAllSettled(
+      ops
+        .filter(([method]) => method === 'delete' || method === 'delete-index')
+        .map(([method, fullpath]) => async () => {
           const filepath = `${dir}/${fullpath}`
-          try {
-            if (method === 'rmdir') {
-              await fs.rmdir(filepath)
-            }
-            index.delete({ filepath: fullpath })
-            if (onProgress) {
-              await onProgress({
-                phase: 'Updating workdir',
-                loaded: ++count,
-                total,
-              })
-            }
-          } catch (e) {
-            if (e.code === 'ENOTEMPTY') {
-              console.log(
-                `Did not delete ${fullpath} because directory is not empty`
-              )
-            } else {
-              throw e
-            }
+          if (method === 'delete') {
+            await fs.rm(filepath)
+          }
+          indexDeletions.push(fullpath)
+          if (onProgress) {
+            await onProgress({
+              phase: 'Updating workdir',
+              loaded: ++count,
+              total,
+            })
+          }
+        }),
+      undefined,
+      total || 1
+    )
+
+    // Directory removals follow the order produced by the tree walk.
+    for (const [method, fullpath] of ops) {
+      if (method === 'rmdir' || method === 'rmdir-index') {
+        const filepath = `${dir}/${fullpath}`
+        try {
+          if (method === 'rmdir') {
+            await fs.rmdir(filepath)
+          }
+          indexDeletions.push(fullpath)
+          if (onProgress) {
+            await onProgress({
+              phase: 'Updating workdir',
+              loaded: ++count,
+              total,
+            })
+          }
+        } catch (e) {
+          if (e.code === 'ENOTEMPTY') {
+            console.log(
+              `Did not delete ${fullpath} because directory is not empty`
+            )
+          } else {
+            throw e
           }
         }
       }
-    })
+    }
 
-    await Promise.all(
+    await batchAllSettled(
       ops
         .filter(([method]) => method === 'mkdir' || method === 'mkdir-index')
-        .map(async function([_, fullpath]) {
+        .map(([_, fullpath]) => async () => {
           const filepath = `${dir}/${fullpath}`
           await fs.mkdir(filepath)
           if (onProgress) {
@@ -224,7 +221,9 @@ export async function _checkout({
               total,
             })
           }
-        })
+        }),
+      undefined,
+      total || 1
     )
 
     if (nonBlocking) {
@@ -238,7 +237,6 @@ export async function _checkout({
       )
 
       const updateWorkingDirResults = await batchAllSettled(
-        'Update Working Dir',
         eligibleOps.map(([method, fullpath, oid, mode, chmod]) => () =>
           updateWorkingDir({ fs, cache, gitdir, dir }, [
             method,
@@ -255,8 +253,8 @@ export async function _checkout({
       await GitIndexManager.acquire(
         { fs, gitdir, cache, allowUnmerged: true },
         async function(index) {
+          for (const filepath of indexDeletions) index.delete({ filepath })
           await batchAllSettled(
-            'Update Index',
             updateWorkingDirResults.map(([fullpath, oid, stats]) => () =>
               updateIndex({ index, fullpath, oid, stats })
             ),
@@ -269,7 +267,7 @@ export async function _checkout({
       await GitIndexManager.acquire(
         { fs, gitdir, cache, allowUnmerged: true },
         async function(index) {
-          await Promise.all(
+          const checkoutResults = await Promise.allSettled(
             ops
               .filter(
                 ([method]) =>
@@ -278,68 +276,32 @@ export async function _checkout({
                   method === 'update' ||
                   method === 'mkdir-index'
               )
-              .map(async function([method, fullpath, oid, mode, chmod]) {
-                const filepath = `${dir}/${fullpath}`
-                try {
-                  if (method !== 'create-index' && method !== 'mkdir-index') {
-                    const { object } = await readObject({
-                      fs,
-                      cache,
-                      gitdir,
-                      oid,
-                    })
-                    if (chmod) {
-                      // Note: the mode option of fs.write only works when creating files,
-                      // not updating them. Since the `fs` plugin doesn't expose `chmod` this
-                      // is our only option.
-                      await fs.rm(filepath)
-                    }
-                    if (mode === 0o100644) {
-                      // regular file
-                      await fs.write(filepath, object)
-                    } else if (mode === 0o100755) {
-                      // executable file
-                      await fs.write(filepath, object, { mode: 0o777 })
-                    } else if (mode === 0o120000) {
-                      // symlink
-                      await fs.writelink(filepath, object)
-                    } else {
-                      throw new InternalError(
-                        `Invalid mode 0o${mode.toString(
-                          8
-                        )} detected in blob ${oid}`
-                      )
-                    }
-                  }
-
-                  const stats = await fs.lstat(filepath)
-                  // We can't trust the executable bit returned by lstat on Windows,
-                  // so we need to preserve this value from the TREE.
-                  // TODO: Figure out how git handles this internally.
-                  if (mode === 0o100755) {
-                    stats.mode = 0o755
-                  }
-                  // Submodules are present in the git index but use a unique mode different from trees
-                  if (method === 'mkdir-index') {
-                    stats.mode = 0o160000
-                  }
-                  index.insert({
-                    filepath: fullpath,
-                    stats,
-                    oid,
+              .map(async function(op) {
+                const result = await updateWorkingDir(
+                  { fs, cache, gitdir, dir },
+                  op
+                )
+                if (onProgress) {
+                  await onProgress({
+                    phase: 'Updating workdir',
+                    loaded: ++count,
+                    total,
                   })
-                  if (onProgress) {
-                    await onProgress({
-                      phase: 'Updating workdir',
-                      loaded: ++count,
-                      total,
-                    })
-                  }
-                } catch (e) {
-                  console.log(e)
                 }
+                return result
               })
           )
+          const failure = checkoutResults.find(
+            result => result.status === 'rejected'
+          )
+          if (failure) throw failure.reason
+          for (const filepath of indexDeletions) index.delete({ filepath })
+          for (const result of checkoutResults) {
+            if (result.status === 'fulfilled') {
+              const [fullpath, oid, stats] = result.value
+              await updateIndex({ index, fullpath, oid, stats })
+            }
+          }
         }
       )
     }
@@ -661,15 +623,11 @@ async function analyze({
 }
 
 async function updateIndex({ index, fullpath, stats, oid }) {
-  try {
-    index.insert({
-      filepath: fullpath,
-      stats,
-      oid,
-    })
-  } catch (e) {
-    console.warn(`Error inserting ${fullpath} into index:`, e)
-  }
+  index.insert({
+    filepath: fullpath,
+    stats,
+    oid,
+  })
 }
 async function updateWorkingDir(
   { fs, cache, gitdir, dir },
@@ -706,28 +664,23 @@ async function updateWorkingDir(
   return [fullpath, oid, stats]
 }
 
-async function batchAllSettled(operationName, tasks, onProgress, batchSize) {
+async function batchAllSettled(tasks, onProgress, batchSize) {
   const results = []
-  try {
-    for (let i = 0; i < tasks.length; i += batchSize) {
-      const batch = tasks.slice(i, i + batchSize).map(task => task())
-      const batchResults = await Promise.allSettled(batch)
-      batchResults.forEach(result => {
-        if (result.status === 'fulfilled') results.push(result.value)
+  for (let i = 0; i < tasks.length; i += batchSize) {
+    const batch = tasks.slice(i, i + batchSize).map(task => task())
+    const batchResults = await Promise.allSettled(batch)
+    const failure = batchResults.find(result => result.status === 'rejected')
+    if (failure) throw failure.reason
+    batchResults.forEach(result => {
+      if (result.status === 'fulfilled') results.push(result.value)
+    })
+    if (onProgress) {
+      await onProgress({
+        phase: 'Updating workdir',
+        loaded: i + batch.length,
+        total: tasks.length,
       })
-      if (onProgress) {
-        await onProgress({
-          phase: 'Updating workdir',
-          loaded: i + batch.length,
-          total: tasks.length,
-        })
-      }
     }
-
-    return results
-  } catch (error) {
-    console.error(`Error during ${operationName}: ${error}`)
   }
-
   return results
 }
