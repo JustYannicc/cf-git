@@ -6,7 +6,10 @@ import pako from 'pako'
 import { InternalError } from '../errors/InternalError.js'
 import { StreamReader } from '../utils/StreamReader.js'
 
-export async function listpack(stream, onData) {
+export async function listpack(stream, onData, budget = {}) {
+  const maxObjectBytes = budget.maxObjectBytes ?? Number.MAX_SAFE_INTEGER
+  const maxTotalObjectBytes =
+    budget.maxTotalObjectBytes ?? Number.MAX_SAFE_INTEGER
   const reader = new StreamReader(stream)
   let PACK = await reader.read(4)
   PACK = PACK.toString('utf8')
@@ -22,35 +25,94 @@ export async function listpack(stream, onData) {
 
   let numObjects = await reader.read(4)
   numObjects = numObjects.readUInt32BE(0)
-  // If (for some godforsaken reason) this is an empty packfile, abort now.
-  if (numObjects < 1) return
+  const declaredObjectCount = numObjects
+  let declaredObjectBytes = budget.used ?? 0
+  let parsedObjectCount = 0
 
-  while (!reader.eof() && numObjects--) {
+  while (parsedObjectCount < declaredObjectCount) {
+    if (reader.eof()) {
+      throw new InternalError(
+        `Packfile ended after ${parsedObjectCount} of ${declaredObjectCount} declared objects`
+      )
+    }
     const offset = reader.tell()
     const { type, length, ofs, reference } = await parseHeader(reader)
-    const inflator = new pako.Inflate()
-    while (!inflator.result) {
+
+    if (![1, 2, 3, 4, 6, 7].includes(type)) {
+      throw new InternalError(`Unsupported pack object type: ${type}`)
+    }
+    if (
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > maxObjectBytes
+    ) {
+      throw new InternalError(
+        `Pack object exceeds configured ${maxObjectBytes}-byte limit`
+      )
+    }
+    declaredObjectBytes += length
+    if (
+      !Number.isSafeInteger(declaredObjectBytes) ||
+      declaredObjectBytes > maxTotalObjectBytes
+    ) {
+      throw new InternalError(
+        `Pack exceeds configured ${maxTotalObjectBytes}-byte object budget`
+      )
+    }
+    budget.used = declaredObjectBytes
+
+    let inflatedBytes = 0
+    const inflatedChunks = []
+    const inflator = new pako.Inflate({
+      chunkSize: Math.max(
+        1,
+        Math.min(64 * 1024, maxObjectBytes || 1, length || 1)
+      ),
+    })
+    inflator.onData = chunk => {
+      inflatedBytes += chunk.byteLength
+      if (inflatedBytes > maxObjectBytes) {
+        throw new InternalError(
+          `Pack object exceeds configured ${maxObjectBytes}-byte limit`
+        )
+      }
+      if (inflatedBytes > length) {
+        throw new InternalError(
+          'Inflated object size is different from that stated in packfile.'
+        )
+      }
+      inflatedChunks.push(chunk)
+    }
+
+    while (!inflator.ended) {
       const chunk = await reader.chunk()
       if (!chunk) break
       inflator.push(chunk, false)
       if (inflator.err) {
         throw new InternalError(`Pako error: ${inflator.msg}`)
       }
-      if (inflator.result) {
-        if (inflator.result.length !== length) {
+      if (inflator.ended) {
+        const data = Buffer.concat(inflatedChunks, inflatedBytes)
+        if (data.length !== length) {
           throw new InternalError(
             `Inflated object size is different from that stated in packfile.`
           )
         }
 
         // Backtrack parser to where deflated data ends
+        const consumedBytes = chunk.length - inflator.strm.avail_in
+        if (consumedBytes < 0 || consumedBytes > chunk.length) {
+          throw new InternalError(
+            'Invalid compressed object length in packfile'
+          )
+        }
         await reader.undo()
-        await reader.read(chunk.length - inflator.strm.avail_in)
+        await reader.read(consumedBytes)
         const end = reader.tell()
         await onData({
-          data: inflator.result,
+          data,
           type,
-          num: numObjects,
+          num: declaredObjectCount - parsedObjectCount,
           offset,
           end,
           reference,
@@ -58,12 +120,23 @@ export async function listpack(stream, onData) {
         })
       }
     }
+    if (!inflator.ended) {
+      throw new InternalError(
+        'Pack object ended before its deflate stream completed'
+      )
+    }
+    parsedObjectCount++
   }
+
+  return { objectCount: parsedObjectCount, endOffset: reader.tell() }
 }
 
 async function parseHeader(reader) {
   // Object type is encoded in bits 654
   let byte = await reader.byte()
+  if (byte === undefined) {
+    throw new InternalError('Packfile ended while reading an object header')
+  }
   const type = (byte >> 4) & 0b111
   // The length encoding get complicated.
   // Last four bits of length is encoded in bits 3210
@@ -74,8 +147,16 @@ async function parseHeader(reader) {
     let shift = 4
     do {
       byte = await reader.byte()
-      length |= (byte & 0b01111111) << shift
-      shift += 7
+      if (byte === undefined) {
+        throw new InternalError('Packfile ended while reading an object length')
+      }
+      length += (byte & 0b01111111) * 2 ** shift
+      if (!Number.isSafeInteger(length)) {
+        throw new InternalError(
+          'Pack object length exceeds the safe integer range'
+        )
+      }
+      if (byte & 0b10000000) shift += 7
     } while (byte & 0b10000000)
   }
   // Handle deltified objects
@@ -87,14 +168,27 @@ async function parseHeader(reader) {
     const bytes = []
     do {
       byte = await reader.byte()
-      ofs |= (byte & 0b01111111) << shift
-      shift += 7
+      if (byte === undefined) {
+        throw new InternalError(
+          'Packfile ended while reading an ofs-delta base'
+        )
+      }
+      ofs += (byte & 0b01111111) * 2 ** shift
+      if (!Number.isSafeInteger(ofs)) {
+        throw new InternalError(
+          'Pack ofs-delta base exceeds the safe integer range'
+        )
+      }
+      if (byte & 0b10000000) shift += 7
       bytes.push(byte)
     } while (byte & 0b10000000)
     reference = Buffer.from(bytes)
   }
   if (type === 7) {
     const buf = await reader.read(20)
+    if (!buf || buf.length !== 20) {
+      throw new InternalError('Packfile ended while reading a ref-delta base')
+    }
     reference = buf
   }
   return { type, length, ofs, reference }

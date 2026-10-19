@@ -14,7 +14,6 @@ import { hasObject } from '../storage/hasObject.js'
 import { _readObject as readObject } from '../storage/readObject.js'
 import { abbreviateRef } from '../utils/abbreviateRef.js'
 import { collect } from '../utils/collect.js'
-import { emptyPackfile } from '../utils/emptyPackfile.js'
 import { filterCapabilities } from '../utils/filterCapabilities.js'
 import { forAwait } from '../utils/forAwait.js'
 import { join } from '../utils/join.js'
@@ -59,6 +58,8 @@ import { writeUploadPackRequest } from '../wire/writeUploadPackRequest.js'
  * @param {Object<string, string>} [args.headers]
  * @param {boolean} [args.prune]
  * @param {boolean} [args.pruneTags]
+ * @param {number} [args.maxObjectBytes] - Maximum inflated or reconstructed object size in bytes. Defaults to no limit.
+ * @param {number} [args.maxTotalObjectBytes] - Maximum total inflated pack data and reconstructed object bytes. Defaults to no limit.
  *
  * @returns {Promise<FetchResult>}
  * @see FetchResult
@@ -87,6 +88,8 @@ export async function _fetch({
   headers = {},
   prune = false,
   pruneTags = false,
+  maxObjectBytes = Number.MAX_SAFE_INTEGER,
+  maxTotalObjectBytes = Number.MAX_SAFE_INTEGER,
 }) {
   const ref = _ref || (await _currentBranch({ fs, gitdir, test: true }))
   const config = await GitConfigManager.get({ fs, gitdir })
@@ -228,6 +231,74 @@ export async function _fetch({
   if (raw.headers) {
     response.headers = raw.headers
   }
+  // We need this value later for the `clone` command.
+  response.HEAD = remoteHTTP.symrefs.get('HEAD')
+  // AWS CodeCommit doesn't list HEAD as a symref, but we can reverse engineer it
+  // Find the SHA of the branch called HEAD
+  if (response.HEAD === undefined) {
+    const { oid } = GitRefManager.resolveAgainstMap({
+      ref: 'HEAD',
+      map: remoteRefs,
+    })
+    // Use the name of the first branch that's not called HEAD that has
+    // the same SHA as the branch called HEAD.
+    for (const [key, value] of remoteRefs.entries()) {
+      if (key !== 'HEAD' && value === oid) {
+        response.HEAD = key
+        break
+      }
+    }
+  }
+  const noun = fullref.startsWith('refs/tags') ? 'tag' : 'branch'
+  response.FETCH_HEAD = {
+    oid,
+    description: `${noun} '${abbreviateRef(fullref)}' of ${url}`,
+  }
+
+  if (onProgress || onMessage) {
+    const lines = splitLines(response.progress)
+    forAwait(lines, async line => {
+      if (onMessage) await onMessage(line)
+      if (onProgress) {
+        const matches = line.match(/([^:]*).*\((\d+?)\/(\d+?)\)/)
+        if (matches) {
+          await onProgress({
+            phase: matches[1].trim(),
+            loaded: parseInt(matches[2], 10),
+            total: parseInt(matches[3], 10),
+          })
+        }
+      }
+    })
+  }
+  const packfile = Buffer.from(await collect(response.packfile))
+  if (response.packfile.error) throw response.packfile.error
+  if (raw.body.error) throw raw.body.error
+  const packfileSha = packfile.slice(-20).toString('hex')
+  const res = {
+    defaultBranch: response.HEAD,
+    fetchHead: response.FETCH_HEAD.oid,
+    fetchHeadDescription: response.FETCH_HEAD.description,
+  }
+  if (response.headers) {
+    res.headers = response.headers
+  }
+  if (packfileSha !== '') {
+    res.packfile = `objects/pack/pack-${packfileSha}.pack`
+    const fullpath = join(gitdir, res.packfile)
+    const getExternalRefDelta = oid => readObject({ fs, cache, gitdir, oid })
+    const idx = await GitPackIndex.fromPack({
+      pack: packfile,
+      getExternalRefDelta,
+      onProgress,
+      maxObjectBytes,
+      maxTotalObjectBytes,
+    })
+    const index = await idx.toBuffer()
+    await fs.write(fullpath, packfile)
+    await fs.write(fullpath.replace(/\.pack$/, '.idx'), index)
+  }
+  // A malformed pack must not advance refs or shallow state.
   // Apply all the 'shallow' and 'unshallow' commands
   for (const oid of response.shallows) {
     if (!oids.has(oid)) {
@@ -302,77 +373,6 @@ export async function _fetch({
       response.pruned = pruned
     }
   }
-  // We need this value later for the `clone` command.
-  response.HEAD = remoteHTTP.symrefs.get('HEAD')
-  // AWS CodeCommit doesn't list HEAD as a symref, but we can reverse engineer it
-  // Find the SHA of the branch called HEAD
-  if (response.HEAD === undefined) {
-    const { oid } = GitRefManager.resolveAgainstMap({
-      ref: 'HEAD',
-      map: remoteRefs,
-    })
-    // Use the name of the first branch that's not called HEAD that has
-    // the same SHA as the branch called HEAD.
-    for (const [key, value] of remoteRefs.entries()) {
-      if (key !== 'HEAD' && value === oid) {
-        response.HEAD = key
-        break
-      }
-    }
-  }
-  const noun = fullref.startsWith('refs/tags') ? 'tag' : 'branch'
-  response.FETCH_HEAD = {
-    oid,
-    description: `${noun} '${abbreviateRef(fullref)}' of ${url}`,
-  }
-
-  if (onProgress || onMessage) {
-    const lines = splitLines(response.progress)
-    forAwait(lines, async line => {
-      if (onMessage) await onMessage(line)
-      if (onProgress) {
-        const matches = line.match(/([^:]*).*\((\d+?)\/(\d+?)\)/)
-        if (matches) {
-          await onProgress({
-            phase: matches[1].trim(),
-            loaded: parseInt(matches[2], 10),
-            total: parseInt(matches[3], 10),
-          })
-        }
-      }
-    })
-  }
-  const packfile = Buffer.from(await collect(response.packfile))
-  if (raw.body.error) throw raw.body.error
-  const packfileSha = packfile.slice(-20).toString('hex')
-  const res = {
-    defaultBranch: response.HEAD,
-    fetchHead: response.FETCH_HEAD.oid,
-    fetchHeadDescription: response.FETCH_HEAD.description,
-  }
-  if (response.headers) {
-    res.headers = response.headers
-  }
-  if (prune) {
-    res.pruned = response.pruned
-  }
-  // This is a quick fix for the empty .git/objects/pack/pack-.pack file error,
-  // which due to the way `git-list-pack` works causes the program to hang when it tries to read it.
-  // TODO: Longer term, we should actually:
-  // a) NOT concatenate the entire packfile into memory (line 78),
-  // b) compute the SHA of the stream except for the last 20 bytes, using the same library used in push.js, and
-  // c) compare the computed SHA with the last 20 bytes of the stream before saving to disk, and throwing a "packfile got corrupted during download" error if the SHA doesn't match.
-  if (packfileSha !== '' && !emptyPackfile(packfile)) {
-    res.packfile = `objects/pack/pack-${packfileSha}.pack`
-    const fullpath = join(gitdir, res.packfile)
-    await fs.write(fullpath, packfile)
-    const getExternalRefDelta = oid => readObject({ fs, cache, gitdir, oid })
-    const idx = await GitPackIndex.fromPack({
-      pack: packfile,
-      getExternalRefDelta,
-      onProgress,
-    })
-    await fs.write(fullpath.replace(/\.pack$/, '.idx'), await idx.toBuffer())
-  }
+  if (prune) res.pruned = response.pruned
   return res
 }

@@ -34,6 +34,8 @@ import { GitConfigManager } from '../managers/GitConfigManager.js'
  * @param {Object<string, string>} args.headers
  * @param {boolean} [args.nonBlocking]
  * @param {number} [args.batchSize]
+ * @param {number} [args.maxObjectBytes] - Maximum inflated or reconstructed object size in bytes. Defaults to no limit.
+ * @param {number} [args.maxTotalObjectBytes] - Maximum total inflated pack data and reconstructed object bytes. Defaults to no limit.
  *
  * @returns {Promise<void>} Resolves successfully when clone completes
  *
@@ -64,6 +66,8 @@ export async function _clone({
   headers,
   nonBlocking,
   batchSize = 100,
+  maxObjectBytes = Number.MAX_SAFE_INTEGER,
+  maxTotalObjectBytes = Number.MAX_SAFE_INTEGER,
 }) {
   try {
     await _init({ fs, gitdir })
@@ -93,6 +97,8 @@ export async function _clone({
       singleBranch,
       headers,
       tags: !noTags,
+      maxObjectBytes,
+      maxTotalObjectBytes,
     })
     if (fetchHead === null) return
     ref = ref || defaultBranch

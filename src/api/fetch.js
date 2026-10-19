@@ -45,6 +45,8 @@ import { join } from '../utils/join.js'
  * @param {string} [args.corsProxy] - Optional [CORS proxy](https://www.npmjs.com/%40isomorphic-git/cors-proxy). Overrides value in repo config.
  * @param {Object<string, string>} [args.headers] - Additional headers to include in HTTP requests, similar to git's `extraHeader` config
  * @param {object} [args.cache] - a [cache](cache.md) object
+ * @param {number} [args.maxObjectBytes] - Maximum inflated or reconstructed object size in bytes. Defaults to no limit.
+ * @param {number} [args.maxTotalObjectBytes] - Maximum total inflated pack data and reconstructed object bytes. Defaults to no limit.
  *
  * @returns {Promise<FetchResult>} Resolves successfully when fetch completes
  * @see FetchResult
@@ -89,6 +91,8 @@ export async function fetch({
   prune = false,
   pruneTags = false,
   cache = {},
+  maxObjectBytes = Number.MAX_SAFE_INTEGER,
+  maxTotalObjectBytes = Number.MAX_SAFE_INTEGER,
 }) {
   try {
     assertParameter('fs', fs)
@@ -119,6 +123,8 @@ export async function fetch({
       headers,
       prune,
       pruneTags,
+      maxObjectBytes,
+      maxTotalObjectBytes,
     })
   } catch (err) {
     err.caller = 'git.fetch'

@@ -70,7 +70,7 @@ describe('GitPackIndex', () => {
       20855
     )
   })
-  it('from .pack when pack is truncated', async () => {
+  it('rejects a truncated pack', async () => {
     const { fs, gitdir } = await makeFixture('test-GitPackIndex')
     const pack = await fs.read(
       path.join(
@@ -78,8 +78,12 @@ describe('GitPackIndex', () => {
         'objects/pack/pack-1a1e70d2f116e8cb0cb42d26019e5c7d0eb01888.pack'
       )
     )
-    const p = await GitPackIndex.fromPack({ pack: pack.slice(0, 12) })
-    expect(p.offsets.size).toBe(0)
+    await expect(
+      GitPackIndex.fromPack({ pack: pack.slice(0, 12) })
+    ).rejects.toMatchObject({
+      code: 'InternalError',
+      data: { message: 'Packfile is truncated before its checksum trailer' },
+    })
   })
   it('to .idx file from .pack', async () => {
     const { fs, gitdir } = await makeFixture('test-GitPackIndex')

@@ -6,7 +6,12 @@ import { BufferCursor } from '../utils/BufferCursor.js'
  * @param {Buffer} source
  * @returns {Buffer}
  */
-export function applyDelta(delta, source) {
+export function applyDelta(
+  delta,
+  source,
+  maxTargetBytes = Number.MAX_SAFE_INTEGER,
+  maxTotalTargetBytes = Number.MAX_SAFE_INTEGER
+) {
   const reader = new BufferCursor(delta)
   const sourceSize = readVarIntLE(reader)
 
@@ -16,6 +21,20 @@ export function applyDelta(delta, source) {
     )
   }
   const targetSize = readVarIntLE(reader)
+  if (
+    !Number.isSafeInteger(targetSize) ||
+    targetSize < 0 ||
+    targetSize > maxTargetBytes
+  ) {
+    throw new InternalError(
+      `Pack object exceeds configured ${maxTargetBytes}-byte limit`
+    )
+  }
+  if (targetSize > maxTotalTargetBytes) {
+    throw new InternalError(
+      `Pack exceeds configured ${maxTotalTargetBytes}-byte object budget`
+    )
+  }
   let target
 
   // Handle empty target (no operations)
@@ -49,12 +68,18 @@ export function applyDelta(delta, source) {
 
 function readVarIntLE(reader) {
   let result = 0
-  let shift = 0
+  let multiplier = 1
   let byte = null
   do {
+    if (reader.eof()) {
+      throw new InternalError('Delta ended while reading a size')
+    }
     byte = reader.readUInt8()
-    result |= (byte & 0b01111111) << shift
-    shift += 7
+    result += (byte & 0b01111111) * multiplier
+    if (!Number.isSafeInteger(result)) {
+      throw new InternalError('Delta size exceeds the safe integer range')
+    }
+    if (byte & 0b10000000) multiplier *= 128
   } while (byte & 0b10000000)
   return result
 }

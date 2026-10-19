@@ -1,6 +1,7 @@
 import crc32 from 'crc-32'
 
 import { InternalError } from '../errors/InternalError.js'
+import { NotFoundError } from '../errors/NotFoundError.js'
 import { GitObject } from '../models/GitObject'
 import { BufferCursor } from '../utils/BufferCursor.js'
 import { applyDelta } from '../utils/applyDelta.js'
@@ -9,34 +10,35 @@ import { inflate } from '../utils/inflate.js'
 import { shasum } from '../utils/shasum.js'
 
 function decodeVarInt(reader) {
-  const bytes = []
-  let byte = 0
-  let multibyte = 0
-  do {
+  let byte = reader.readUInt8()
+  let result = byte & 0b01111111
+  while (byte & 0b10000000) {
     byte = reader.readUInt8()
-    // We keep bits 6543210
-    const lastSeven = byte & 0b01111111
-    bytes.push(lastSeven)
-    // Whether the next byte is part of the variable-length encoded number
-    // is encoded in bit 7
-    multibyte = byte & 0b10000000
-  } while (multibyte)
-  // Now that all the bytes are in big-endian order,
-  // alternate shifting the bits left by 7 and OR-ing the next byte.
-  // And... do a weird increment-by-one thing that I don't quite understand.
-  return bytes.reduce((a, b) => ((a + 1) << 7) | b, -1)
+    result = (result + 1) * 128 + (byte & 0b01111111)
+    if (!Number.isSafeInteger(result)) {
+      throw new InternalError(
+        'Pack ofs-delta base exceeds the safe integer range'
+      )
+    }
+  }
+  return result
 }
 
 // I'm pretty much copying this one from the git C source code,
 // because it makes no sense.
 function otherVarIntDecode(reader, startWith) {
   let result = startWith
-  let shift = 4
+  let multiplier = 16
   let byte = null
   do {
     byte = reader.readUInt8()
-    result |= (byte & 0b01111111) << shift
-    shift += 7
+    result += (byte & 0b01111111) * multiplier
+    if (!Number.isSafeInteger(result)) {
+      throw new InternalError(
+        'Pack object length exceeds the safe integer range'
+      )
+    }
+    if (byte & 0b10000000) multiplier *= 128
   } while (byte & 0b10000000)
   return result
 }
@@ -45,6 +47,7 @@ export class GitPackIndex {
   constructor(stuff) {
     Object.assign(this, stuff)
     this.offsetCache = {}
+    this.materializedOffsets = new Set()
   }
 
   static async fromIdx({ idx, getExternalRefDelta }) {
@@ -91,7 +94,26 @@ export class GitPackIndex {
     })
   }
 
-  static async fromPack({ pack, getExternalRefDelta, onProgress }) {
+  static async fromPack({
+    pack,
+    getExternalRefDelta,
+    onProgress,
+    maxObjectBytes = Number.MAX_SAFE_INTEGER,
+    maxTotalObjectBytes = Number.MAX_SAFE_INTEGER,
+  }) {
+    if (!Number.isSafeInteger(maxObjectBytes) || maxObjectBytes < 0) {
+      throw new RangeError('maxObjectBytes must be a non-negative safe integer')
+    }
+    if (!Number.isSafeInteger(maxTotalObjectBytes) || maxTotalObjectBytes < 0) {
+      throw new RangeError(
+        'maxTotalObjectBytes must be a non-negative safe integer'
+      )
+    }
+    const packBudget = {
+      maxObjectBytes,
+      maxTotalObjectBytes,
+      used: 0,
+    }
     const listpackTypes = {
       1: 'commit',
       2: 'tree',
@@ -102,52 +124,71 @@ export class GitPackIndex {
     }
     const offsetToObject = {}
 
-    // Older packfiles do NOT use the shasum of the pack itself,
-    // so it is recommended to just use whatever bytes are in the trailer.
-    // Source: https://github.com/git/git/commit/1190a1acf800acdcfd7569f87ac1560e2d077414
+    if (pack.byteLength < 32) {
+      throw new InternalError(
+        'Packfile is truncated before its checksum trailer'
+      )
+    }
+    const packBody = pack.slice(0, -20)
     const packfileSha = pack.slice(-20).toString('hex')
+    if ((await shasum(packBody)) !== packfileSha) {
+      throw new InternalError('Packfile checksum does not match its trailer')
+    }
+    const declaredObjectCount = pack.readUInt32BE(8)
 
     const hashes = []
     const crcs = {}
     const offsets = new Map()
-    let totalObjectCount = null
+    const totalObjectCount = declaredObjectCount
     let lastPercent = null
 
-    await listpack([pack], async ({ data, type, reference, offset, num }) => {
-      if (totalObjectCount === null) totalObjectCount = num
-      const percent = Math.floor(
-        ((totalObjectCount - num) * 100) / totalObjectCount
-      )
-      if (percent !== lastPercent) {
-        if (onProgress) {
-          await onProgress({
-            phase: 'Receiving objects',
-            loaded: totalObjectCount - num,
-            total: totalObjectCount,
-          })
+    const parsedPack = await listpack(
+      [packBody],
+      async ({ data, type, reference, offset, num }) => {
+        const percent = Math.floor(
+          ((totalObjectCount - num) * 100) / totalObjectCount
+        )
+        if (percent !== lastPercent) {
+          if (onProgress) {
+            await onProgress({
+              phase: 'Receiving objects',
+              loaded: totalObjectCount - num,
+              total: totalObjectCount,
+            })
+          }
         }
-      }
-      lastPercent = percent
-      // Change type from a number to a meaningful string
-      type = listpackTypes[type]
+        lastPercent = percent
+        // Change type from a number to a meaningful string
+        const objectType = listpackTypes[type]
+        if (objectType === undefined) {
+          throw new InternalError(`Unsupported pack object type: ${type}`)
+        }
+        type = objectType
 
-      if (['commit', 'tree', 'blob', 'tag'].includes(type)) {
         offsetToObject[offset] = {
           type,
           offset,
         }
-      } else if (type === 'ofs-delta') {
-        offsetToObject[offset] = {
-          type,
-          offset,
-        }
-      } else if (type === 'ref-delta') {
-        offsetToObject[offset] = {
-          type,
-          offset,
-        }
-      }
-    })
+      },
+      packBudget
+    )
+    if (parsedPack.objectCount !== declaredObjectCount) {
+      throw new InternalError(
+        `Packfile declared ${declaredObjectCount} objects but parsed ${parsedPack.objectCount}`
+      )
+    }
+    if (Object.keys(offsetToObject).length !== declaredObjectCount) {
+      throw new InternalError(
+        `Packfile indexed ${
+          Object.keys(offsetToObject).length
+        } of ${declaredObjectCount} declared objects`
+      )
+    }
+    if (parsedPack.endOffset !== packBody.byteLength) {
+      throw new InternalError(
+        'Packfile object count does not match its body length'
+      )
+    }
 
     // We need to know the lengths of the slices to compute the CRCs.
     const offsetArray = Object.keys(offsetToObject).map(Number)
@@ -168,42 +209,54 @@ export class GitPackIndex {
       hashes,
       offsets,
       getExternalRefDelta,
+      packBudget,
     })
 
     // Resolve deltas and compute the oids
     lastPercent = null
     let count = 0
     const objectsByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    for (let offset in offsetToObject) {
-      offset = Number(offset)
-      const percent = Math.floor((count * 100) / totalObjectCount)
-      if (percent !== lastPercent) {
-        if (onProgress) {
-          await onProgress({
-            phase: 'Resolving deltas',
-            loaded: count,
-            total: totalObjectCount,
-          })
+    let unresolvedOffsets = Object.keys(offsetToObject).map(Number)
+    while (unresolvedOffsets.length > 0) {
+      const retryOffsets = []
+      let resolvedThisPass = 0
+      for (const offset of unresolvedOffsets) {
+        const percent = Math.floor((count * 100) / totalObjectCount)
+        if (percent !== lastPercent) {
+          if (onProgress) {
+            await onProgress({
+              phase: 'Resolving deltas',
+              loaded: count,
+              total: totalObjectCount,
+            })
+          }
+        }
+        lastPercent = percent
+
+        const o = offsetToObject[offset]
+        try {
+          p.readDepth = 0
+          p.externalReadDepth = 0
+          const { type, object } = await p.readSlice({ start: offset })
+          objectsByDepth[p.readDepth] += 1
+          const oid = await shasum(GitObject.wrap({ type, object }))
+          o.oid = oid
+          hashes.push(oid)
+          offsets.set(oid, offset)
+          crcs[oid] = o.crc
+          count++
+          resolvedThisPass++
+        } catch (err) {
+          if (!(err instanceof NotFoundError)) throw err
+          retryOffsets.push(offset)
         }
       }
-      count++
-      lastPercent = percent
-
-      const o = offsetToObject[offset]
-      if (o.oid) continue
-      try {
-        p.readDepth = 0
-        p.externalReadDepth = 0
-        const { type, object } = await p.readSlice({ start: offset })
-        objectsByDepth[p.readDepth] += 1
-        const oid = await shasum(GitObject.wrap({ type, object }))
-        o.oid = oid
-        hashes.push(oid)
-        offsets.set(oid, offset)
-        crcs[oid] = o.crc
-      } catch (err) {
-        continue
+      if (retryOffsets.length > 0 && resolvedThisPass === 0) {
+        throw new InternalError(
+          `Could not resolve ${retryOffsets.length} packfile delta object(s)`
+        )
       }
+      unresolvedOffsets = retryOffsets
     }
 
     hashes.sort()
@@ -264,10 +317,15 @@ export class GitPackIndex {
   }
 
   async read({ oid }) {
-    if (!this.offsets.get(oid)) {
+    if (!this.offsets.has(oid)) {
       if (this.getExternalRefDelta) {
         this.externalReadDepth++
         return this.getExternalRefDelta(oid)
+      } else if (this.packBudget) {
+        // During fromPack, an unresolved hash may refer to an object that
+        // appears later in the same pack. Let the resolver retry after indexing
+        // the rest of the objects.
+        throw new NotFoundError(oid)
       } else {
         throw new InternalError(`Could not read object ${oid} from packfile`)
       }
@@ -318,16 +376,31 @@ export class GitPackIndex {
     // Handle deltified objects
     if (type === 'ofs_delta') {
       const offset = decodeVarInt(reader)
+      if (offset <= 0 || offset >= start) {
+        throw new InternalError('Invalid ofs-delta base offset')
+      }
       const baseOffset = start - offset
       ;({ object: base, type } = await this.readSlice({ start: baseOffset }))
     }
     if (type === 'ref_delta') {
-      const oid = reader.slice(20).toString('hex')
+      const reference = reader.slice(20)
+      if (reference.byteLength !== 20) {
+        throw new InternalError('Packfile ended while reading a ref-delta base')
+      }
+      const oid = reference.toString('hex')
       ;({ object: base, type } = await this.read({ oid }))
     }
     // Handle undeltified objects
     const buffer = raw.slice(reader.tell())
-    object = Buffer.from(await inflate(buffer))
+    object = Buffer.from(
+      await inflate(
+        buffer,
+        Math.min(
+          this.packBudget?.maxObjectBytes ?? Number.MAX_SAFE_INTEGER,
+          length
+        )
+      )
+    )
     // Assert that the object length is as expected.
     if (object.byteLength !== length) {
       throw new InternalError(
@@ -335,7 +408,34 @@ export class GitPackIndex {
       )
     }
     if (base) {
-      object = Buffer.from(applyDelta(object, base))
+      const maxObjectBytes =
+        this.packBudget?.maxObjectBytes ?? Number.MAX_SAFE_INTEGER
+      const needsMaterializationBudget =
+        this.packBudget && !this.materializedOffsets.has(start)
+      const remainingObjectBytes = needsMaterializationBudget
+        ? this.packBudget.maxTotalObjectBytes - this.packBudget.used
+        : Number.MAX_SAFE_INTEGER
+      object = Buffer.from(
+        applyDelta(object, base, maxObjectBytes, remainingObjectBytes)
+      )
+    }
+    if (this.packBudget && !this.materializedOffsets.has(start)) {
+      if (object.byteLength > this.packBudget.maxObjectBytes) {
+        throw new InternalError(
+          `Pack object exceeds configured ${this.packBudget.maxObjectBytes}-byte limit`
+        )
+      }
+      const used = this.packBudget.used + object.byteLength
+      if (
+        !Number.isSafeInteger(used) ||
+        used > this.packBudget.maxTotalObjectBytes
+      ) {
+        throw new InternalError(
+          `Pack exceeds configured ${this.packBudget.maxTotalObjectBytes}-byte object budget`
+        )
+      }
+      this.packBudget.used = used
+      this.materializedOffsets.add(start)
     }
     // Cache the result based on depth.
     if (this.readDepth > 3) {

@@ -35,6 +35,8 @@ import { join } from '../utils/join.js'
  * @param {object} [args.cache] - a [cache](cache.md) object
  * @param {boolean} [args.nonBlocking = false] - if true, checkout will happen non-blockingly (useful for long-running operations blocking the thread in browser environments)
  * @param {number} [args.batchSize = 100] - If args.nonBlocking is true, batchSize is the number of files to process at a time avoid blocking the executing thread. The default value of 100 is a good starting point.
+ * @param {number} [args.maxObjectBytes] - Maximum inflated or reconstructed object size in bytes. Defaults to no limit.
+ * @param {number} [args.maxTotalObjectBytes] - Maximum total inflated pack data and reconstructed object bytes. Defaults to no limit.
  *
  * @returns {Promise<void>} Resolves successfully when clone completes
  *
@@ -77,6 +79,8 @@ export async function clone({
   cache = {},
   nonBlocking = false,
   batchSize = 100,
+  maxObjectBytes = Number.MAX_SAFE_INTEGER,
+  maxTotalObjectBytes = Number.MAX_SAFE_INTEGER,
 }) {
   try {
     assertParameter('fs', fs)
@@ -113,6 +117,8 @@ export async function clone({
       headers,
       nonBlocking,
       batchSize,
+      maxObjectBytes,
+      maxTotalObjectBytes,
     })
   } catch (err) {
     err.caller = 'git.clone'
